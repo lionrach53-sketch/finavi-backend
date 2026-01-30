@@ -1,0 +1,28 @@
+{
+  "name": "coach-financier-backend",
+  "version": "1.0.0",
+  "description": "Backend for Coach Financier (Node + Express + MongoDB)",
+  "main": "serve.js",
+  "scripts": {
+    "start": "node serve.js",
+    "dev": "node serve.js",
+    "build-front": "node scripts/build-and-copy-front.js",
+    "test:integration": "node tests/tontine_integration_test.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "helmet": "^7.0.0",
+    "joi": "^17.11.0",
+    "mongoose": "^7.0.0",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^8.12.0",
+    "node-fetch": "^3.2.10"
+  }
+}

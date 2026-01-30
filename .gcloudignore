@@ -1,0 +1,14 @@
+# Files to ignore when deploying to Google Cloud
+node_modules/
+npm-debug.log*
+.DS_Store
+.env
+.git/
+.gitignore
+*.log
+.vscode/
+.idea/
+tests/
+*.md
+.env.local
+.env.*.local
