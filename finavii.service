@@ -1,0 +1,22 @@
+[Unit]
+Description=Finavii Coach Financier API (node)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/finavii
+EnvironmentFile=/opt/finavii/.env
+ExecStart=/usr/bin/node serve.js
+Restart=always
+RestartSec=5
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=finavii-api
+
+[Install]
+WantedBy=multi-user.target
+
+# Notes:
+# - Copy the backend into /opt/finavii on the VM, set owner to appropriate user
+# - Adjust User and paths as needed. Use 'sudo systemctl enable finavii' then 'sudo systemctl start finavii'
