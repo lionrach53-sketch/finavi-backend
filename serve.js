@@ -36,6 +36,22 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+// Ensure preflight (OPTIONS) requests are handled with CORS headers
+app.options('*', cors(corsOptions));
+// Fallback: ensure CORS headers are set on all responses (helpful if upstream strips them)
+app.use((req, res, next) => {
+  try {
+    if (!res.getHeader('Access-Control-Allow-Origin')) {
+      res.setHeader('Access-Control-Allow-Origin', typeof corsOptions.origin === 'boolean' && corsOptions.origin === true ? '*' : (corsOptions.origin || '*'));
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  } catch (e) {}
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json());
 
 // Security headers
@@ -619,14 +635,21 @@ app.get('/api', (req, res) => {
 app.get('/api/check-user/:phoneNumber', asyncHandler(async (req, res) => {
   const { phoneNumber } = req.params;
   const userEmail = `${phoneNumber.replace(/\D/g, '')}@test.local`;
-  
-  const exists = await User.findOne({ email: userEmail });
-  
-  res.json({
-    phoneNumber: phoneNumber,
-    exists: !!exists,
-    message: exists ? 'Compte trouvé' : 'Aucun compte trouvé'
-  });
+  logger.info(`Incoming check-user request for ${phoneNumber}`);
+  logger.debug('Computed userEmail for check-user', { userEmail });
+  try {
+    const exists = await User.findOne({ email: userEmail });
+    logger.debug('check-user DB result', { exists: !!exists });
+    res.json({
+      phoneNumber: phoneNumber,
+      exists: !!exists,
+      message: exists ? 'Compte trouvé' : 'Aucun compte trouvé'
+    });
+  } catch (err) {
+    console.error('Error in /api/check-user', err && err.stack ? err.stack : err);
+    // rethrow to be handled by global error handler
+    throw err;
+  }
 }));
 
 // GET /api/user-by-phone/:phoneNumber - Retourne l'utilisateur complet par numéro
@@ -1306,8 +1329,11 @@ app.post('/api/register', asyncHandler(async (req, res) => {
   const { phoneNumber, firstName, lastName } = req.body;
   // Optional: primary income to seed the main budget and whether to create default budgets
   const { primaryIncomeAmount, primaryIncomeFrequency, createDefaultBudgets } = req.body;
-  
+  logger.info('Incoming register request');
+  logger.debug('register request body', { body: req.body });
+
   if (!phoneNumber || !firstName || !lastName) {
+    logger.warn('register validation failed - missing fields', { phoneNumber, firstName, lastName });
     return res.status(400).json({ 
       message: 'Numéro de téléphone, prénom et nom sont requis' 
     });
@@ -1324,7 +1350,13 @@ app.post('/api/register', asyncHandler(async (req, res) => {
   }
   
   // Créer le nouvel utilisateur
-  const userId = await createUser(phoneNumber, `${firstName} ${lastName}`, userEmail);
+  let userId;
+  try {
+    userId = await createUser(phoneNumber, `${firstName} ${lastName}`, userEmail);
+  } catch (err) {
+    console.error('Error creating user in /api/register', err && err.stack ? err.stack : err);
+    throw err;
+  }
 
   // Create default budgets: monthly (primary) + weekly + daily with proper cascade allocation.
   // User can customize names/amounts after login.
@@ -2056,6 +2088,7 @@ app.post('/api/push/unsubscribe', asyncHandler(async (req, res) => {
 // Global error handler
 app.use((err, req, res, next) => {
   console.error('❌ Erreur non gérée:', err);
+  console.error(err && err.stack ? err.stack : err);
   
   // Erreurs Joi
   if (err.details && err.details[0]?.type === 'object.unknown') {
