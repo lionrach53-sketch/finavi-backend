@@ -16,6 +16,15 @@ const app = express();
 // Set NODE_ENV early - defaults to 'development' for fallback to MongoMemoryServer
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
+// Lightweight logger used throughout the server. Controlled by LOG_LEVEL env var ('debug'|'info'|'warn'|'error').
+const LOG_LEVEL = process.env.LOG_LEVEL || process.env.VITE_LOG_LEVEL || 'info';
+const logger = {
+  info: (...args) => { if (['info', 'debug'].includes(LOG_LEVEL)) console.log('ℹ️', ...args); },
+  debug: (...args) => { if (LOG_LEVEL === 'debug') console.log('🔍', ...args); },
+  warn: (...args) => { if (['info','debug','warn'].includes(LOG_LEVEL)) console.warn('⚠️', ...args); },
+  error: (...args) => { console.error('❌', ...args); }
+};
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -600,6 +609,47 @@ async function computeArgentEnPoche(userId, currentDate) {
     return Math.max(0, Math.round((salaryBudget.initialAmount || 0) / 4));
   }
   return Math.max(0, Math.round(weeklyBudget.currentAmount || 0));
+}
+
+// Compute intelligent dynamic limits (monthly -> weekly -> daily) based on
+// the budget still disponible and the remaining days in a 30‑day cycle.
+// This does not modify the DB, it only returns recommendations used by the frontend.
+function computeDynamicLimits(budgetsAvailable, currentDate) {
+  const available = Math.max(0, Number(budgetsAvailable || 0));
+  if (!available) {
+    return {
+      monthlyAvailable: 0,
+      weeklyLimit: 0,
+      dailyLimit: 0,
+      daysLeft: 0,
+      weeksLeft: 0
+    };
+  }
+
+  const dateStr = currentDate || getTodayDate(); // 'YYYY-MM-DD'
+  let dayOfMonth = 1;
+  try {
+    const parts = dateStr.split('-').map((p) => parseInt(p, 10));
+    if (parts.length === 3 && !Number.isNaN(parts[2])) {
+      dayOfMonth = parts[2];
+    }
+  } catch (_) {}
+
+  const DAYS_IN_CYCLE = 30;
+  const dayIndex = Math.min(DAYS_IN_CYCLE, Math.max(1, dayOfMonth));
+  const daysLeft = Math.max(1, DAYS_IN_CYCLE - dayIndex + 1);
+  const weeksLeft = Math.max(1, Math.ceil(daysLeft / 7));
+
+  const dailyLimit = Math.floor(available / daysLeft);
+  const weeklyLimit = Math.floor(available / weeksLeft);
+
+  return {
+    monthlyAvailable: available,
+    weeklyLimit,
+    dailyLimit,
+    daysLeft,
+    weeksLeft
+  };
 }
 
 // Générer un conseil IA basique (à améliorer avec une vraie IA)
@@ -1275,6 +1325,38 @@ app.get('/api/dashboard/:userId', asyncHandler(async (req, res) => {
   // Gains from other sources DO NOT increase argent en poche
   const argent_en_poche = await computeArgentEnPoche(userId, currentDate);
 
+  // Dynamic intelligent limits (month -> week -> day) based on remaining monthly budget
+  const dynamicLimits = computeDynamicLimits(budgetsAvailable, currentDate);
+
+  // Analyse des seuils hebdomadaires et mensuels pour le conseil IA
+  let weeklyExpenses = 0;
+  try {
+    const current = new Date(currentDate);
+    const weekStart = new Date(current);
+    weekStart.setDate(current.getDate() - 6); // 7 derniers jours, aujourd'hui inclus
+    const weekStartStr = weekStart.toISOString().slice(0, 10);
+    const weekDays = await Day.find({
+      userId,
+      date: { $gte: weekStartStr, $lte: currentDate }
+    });
+    weeklyExpenses = weekDays.reduce((sum, d) => sum + (d.expenses || 0), 0);
+  } catch (e) {
+    weeklyExpenses = 0;
+  }
+
+  // Baseline mensuelle issue du budget primaire (salaire principal)
+  const primaryMonthly = budgets.find(b => b.isPrimary && b.frequency === 'monthly') || null;
+  let monthlyBaseline = null;
+  let monthlyUsed = null;
+  let monthlyUsageRatio = null;
+  if (primaryMonthly) {
+    monthlyBaseline = Number(primaryMonthly.initialAmount || primaryMonthly.amount || 0) || null;
+    if (monthlyBaseline && typeof budgetsAvailable === 'number') {
+      monthlyUsed = Math.max(0, monthlyBaseline - budgetsAvailable);
+      monthlyUsageRatio = monthlyUsed / monthlyBaseline;
+    }
+  }
+
   // Objectifs
   const objectives = await Objective.find({ userId });
   const objectivesFormatted = objectives.map(o => ({
@@ -1290,6 +1372,7 @@ app.get('/api/dashboard/:userId', asyncHandler(async (req, res) => {
   // AI advice: single short actionable advice based on today's balance, expenses, budget overruns and active objective
   let aiAdvice = '';
   const activeObjective = objectives.find(o => !o.achieved) || null;
+  const { monthlyAvailable, weeklyLimit, dailyLimit, daysLeft, weeksLeft } = dynamicLimits || {};
   // Detect any budget overrun (unbounded remaining < 0)
   let budgetOverrun = false;
   for (const w of wallets) {
@@ -1303,6 +1386,17 @@ app.get('/api/dashboard/:userId', asyncHandler(async (req, res) => {
     aiAdvice = `Votre argent en poche est épuisé. Réduisez immédiatement les dépenses non-essentielles.`;
   } else if (budgetOverrun) {
     aiAdvice = 'Un de vos budgets est dépassé aujourd\'hui — réduisez ou réallouez des dépenses.';
+  } else if (monthlyUsageRatio != null && monthlyUsageRatio > 0.9) {
+    // Plus de 90% du budget mensuel déjà utilisé
+    const remaining = Math.max(0, (monthlyBaseline || 0) - (monthlyUsed || 0));
+    aiAdvice = `Attention, vous avez déjà utilisé plus de 90% de votre budget mensuel principal. Il ne vous reste que ${remaining} XOF pour finir le mois. Réduisez fortement les dépenses non essentielles.`;
+  } else if (weeklyLimit && weeklyExpenses > weeklyLimit) {
+    const diffWeek = weeklyExpenses - weeklyLimit;
+    aiAdvice = `Sur les 7 derniers jours, vos dépenses (${weeklyExpenses} XOF) dépassent le seuil conseillé hebdomadaire de ${weeklyLimit} XOF (écart de ${diffWeek} XOF). Ralentissez les dépenses cette semaine pour rester dans le budget du mois.`;
+  } else if (dailyLimit && totalExpenses > dailyLimit) {
+    const diffDay = totalExpenses - dailyLimit;
+    const remainingDays = daysLeft || 1;
+    aiAdvice = `Aujourd'hui vos dépenses (${totalExpenses} XOF) dépassent le seuil conseillé de ${dailyLimit} XOF pour respecter votre budget du mois (écart de ${diffDay} XOF). Pour les ${remainingDays} prochains jours, essayez de rester autour de ${Math.floor((monthlyAvailable || 0) / remainingDays)} XOF par jour.`;
   } else if (activeObjective && argent_en_poche < activeObjective.targetAmount * 0.2) {
     aiAdvice = `Pensez à augmenter vos gains ou réduire dépenses pour progresser vers l\'objectif ${activeObjective.targetAmount} XOF.`;
   } else if (totalExpenses > totalGains) {
@@ -1317,6 +1411,7 @@ app.get('/api/dashboard/:userId', asyncHandler(async (req, res) => {
     user: { id: user._id.toString(), name: user.name, email: user.email, subscription: user.subscription || null },
     argent_en_poche,
     budgetsAvailable,
+     dynamicLimits,
     wallets,
     transactions: todayTransactions.map(t => ({ id: t._id.toString(), type: t.type, amount: t.amount, comment: t.comment, time: t.time, budgetId: t.budgetId ? t.budgetId.toString() : null })),
     objectives: objectivesFormatted,
