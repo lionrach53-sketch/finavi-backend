@@ -325,7 +325,13 @@ const tontineSchema = new mongoose.Schema({
   frequency: { type: String, required: false },
   budgetId: { type: mongoose.Schema.Types.ObjectId, ref: 'Budget', required: false },
   participantsCount: { type: Number, default: 0 },
-  members: [{ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, contributed: { type: Number, default: 0 }, position: { type: Number } }],
+  members: [{
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    contributed: { type: Number, default: 0 },
+    position: { type: Number },
+    // Dernier jour où un rappel de contribution a été envoyé à ce membre (YYYY-MM-DD)
+    lastReminderDate: { type: String, required: false }
+  }],
   totalAmount: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
 });
@@ -464,6 +470,54 @@ function periodsElapsedSince(startDateStr, frequency) {
   // daily
   const msPerDay = 1000 * 60 * 60 * 24;
   return Math.floor((now - start) / msPerDay);
+}
+
+// Build a concise summary of the user's tontines for AI prompts.
+// Returns an array of human-readable strings describing each active tontine.
+async function buildTontineContextForUser(userId) {
+  try {
+    const tontines = await Tontine.find({
+      $or: [
+        { ownerId: userId },
+        { 'members.userId': userId }
+      ]
+    }).limit(10);
+
+    if (!tontines.length) return [];
+
+    const today = getTodayDate();
+    return tontines.map(t => {
+      const participants = Number(t.participantsCount || (t.members ? t.members.length : 0) || 0);
+      const contribAmount = Number(t.contributionAmount || 0);
+      const potAmount = participants > 0 && contribAmount > 0 ? (participants * contribAmount) : 0;
+
+      const member = (t.members || []).find(m => m.userId && m.userId.toString() === userId.toString());
+      const myContrib = member ? Number(member.contributed || 0) : 0;
+      const myPosition = member && typeof member.position !== 'undefined' ? Number(member.position) : null;
+
+      const freq = t.frequency || 'monthly';
+      const elapsed = periodsElapsedSince(t.startDate || today, freq);
+      const pCount = participants > 0 ? participants : 1;
+      const currentReceiverIndex = ((elapsed % pCount) + 1);
+      const turnsUntilMe = myPosition && participants
+        ? ((myPosition - currentReceiverIndex + participants) % participants)
+        : null;
+
+      return [
+        `tontine "${t.name}"`,
+        `freq=${freq}`,
+        `participants=${participants || 'N/A'}`,
+        `cotisation=${contribAmount || 0} XOF`,
+        `pot=${potAmount || 0} XOF`,
+        `ma_contrib=${myContrib || 0} XOF`,
+        `ma_position=${myPosition || 'N/A'}`,
+        `tours_restant_avant_mon_tour=${turnsUntilMe != null ? turnsUntilMe : 'N/A'}`
+      ].join(', ');
+    });
+  } catch (e) {
+    logger.warn('buildTontineContextForUser failed', e && e.message ? e.message : e);
+    return [];
+  }
 }
 
 // Helper function to create a new user
@@ -2309,8 +2363,9 @@ app.post('/api/ai/advice', asyncHandler(async (req, res) => {
         const budgets = await Budget.find({ userId: resolved }).limit(10);
         const objectives = await Objective.find({ userId: resolved }).limit(5);
         const recentTx = await Transaction.find({ userId: resolved }).sort({ createdAt: -1 }).limit(10);
-        // Build a clearer prompt: short summary, 3 prioritized actions, and explicit alerts if any.
-        prompt = `Résumé utilisateur:\nBudgets: ${budgets.map(b => `${b.name}=${b.amount}/${b.frequency}`).join('; ')}\nObjectifs: ${objectives.map(o => `${o.name || 'obj'} ${o.savedAmount || 0}/${o.targetAmount}`).join('; ')}\nTransactions récentes: ${recentTx.map(t => `${t.type} ${t.amount} (${t.comment})`).join('; ')}\n\nConsignes:\n- Réponds en français de façon concise et empathique.\n- Commence par un court résumé (1-2 phrases).\n- Ensuite fournis 3 actions prioritaires et concrètes que l'utilisateur peut faire (numérotées).\n- Si des alertes sont nécessaires (ex: dépassement de budget, objectif en retard), affiche-les clairement après les actions.\n- Termine par un petit rappel motivant.\nNe fournis PAS d'informations sensibles ni de diagnostics financiers complexes. Merci.`;
+        const tontineSummaries = await buildTontineContextForUser(resolved);
+        // Build a clearer prompt: short summary, 3 prioritized actions, explicit alerts and dedicated tontine guidance.
+        prompt = `Résumé utilisateur:\nBudgets: ${budgets.map(b => `${b.name}=${b.amount}/${b.frequency}`).join('; ')}\nObjectifs: ${objectives.map(o => `${o.name || 'obj'} ${o.savedAmount || 0}/${o.targetAmount}`).join('; ')}\nTransactions récentes: ${recentTx.map(t => `${t.type} ${t.amount} (${t.comment})`).join('; ')}${tontineSummaries.length ? `\nTontines: ${tontineSummaries.join(' | ')}` : ''}\n\nConsignes:\n- Réponds en français de façon concise et empathique.\n- Commence par un court résumé (1-2 phrases) de la situation globale.\n- Ensuite, propose 3 actions prioritaires et concrètes que l'utilisateur peut faire (numérotées).\n- Si des alertes sont nécessaires (ex: dépassement de budget, objectif en retard), affiche-les clairement après les actions.\n- Si des tontines sont mentionnées ci-dessus, ajoute une section dédiée:\n  * donne 1 à 2 idées concrètes sur comment utiliser intelligemment l'argent reçu lors de la tontine (petit projet, remboursement de dette, épargne de sécurité, etc.).\n  * donne 1 conseil simple pour rester discipliné dans les cotisations (ne pas rater les contributions).\n- Termine par un petit rappel motivant et adapté au contexte.\nNe fournis PAS d'informations sensibles ni de diagnostics financiers complexes. Merci.`;
       } else {
         prompt = 'Donne des recommandations financières générales et priorisées en francais.';
       }
@@ -2350,6 +2405,92 @@ app.post('/api/ai/advice', asyncHandler(async (req, res) => {
     return res.status(500).json({ success: false, message: 'Erreur lors de l appel à OpenAI', error: err.message || String(err) });
   }
 }));
+
+// Server-side tontine reminders: send push notifications on contribution days
+async function sendTontineContributionReminders() {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    return; // push not configured
+  }
+  const today = getTodayDate();
+
+  try {
+    const tontines = await Tontine.find({
+      $and: [
+        { $or: [{ endDate: null }, { endDate: { $gte: today } }] },
+        { $or: [{ startDate: null }, { startDate: { $lte: today } }] }
+      ]
+    });
+
+    if (!tontines.length) return;
+
+    for (const t of tontines) {
+      const freq = t.frequency || 'monthly';
+      const start = t.startDate || today;
+
+      // determine if today is contribution day for this tontine
+      let shouldContributeToday = false;
+      const startDateObj = new Date(start);
+      const todayObj = new Date(today);
+
+      if (freq === 'once') {
+        shouldContributeToday = today === start;
+      } else if (freq === 'weekly') {
+        shouldContributeToday = todayObj.getDay() === startDateObj.getDay();
+      } else if (freq === 'monthly') {
+        shouldContributeToday = todayObj.getDate() === startDateObj.getDate();
+      }
+
+      if (!shouldContributeToday) continue;
+
+      let membersChanged = false;
+      for (const m of t.members || []) {
+        if (!m.userId) continue;
+        if (m.lastReminderDate === today) continue; // already reminded today
+
+        try {
+          const u = await User.findById(m.userId);
+          if (!u) continue;
+          // Respect user preferences: require reminders enabled
+          if (u.preferences && u.preferences.reminders === false) continue;
+
+          const subs = await PushSubscription.find({ userId: m.userId });
+          if (!subs.length) continue;
+
+          const amount = Number(t.contributionAmount || 0) || 0;
+          const payload = JSON.stringify({
+            title: 'Rappel tontine',
+            body: `C'est le moment de contribuer à la tontine "${t.name}" pour ${amount.toLocaleString('fr-FR')} XOF.`,
+            type: 'tontine-reminder'
+          });
+
+          for (const s of subs) {
+            try {
+              await webpush.sendNotification(s.subscription, payload);
+            } catch (err) {
+              logger.warn('Push tontine reminder failed, removing subscription', err && err.message ? err.message : err);
+              try { await PushSubscription.deleteOne({ _id: s._id }); } catch (e) {}
+            }
+          }
+
+          m.lastReminderDate = today;
+          membersChanged = true;
+        } catch (e) {
+          logger.warn('sendTontineContributionReminders member loop error', e && e.message ? e.message : e);
+        }
+      }
+
+      if (membersChanged) {
+        try {
+          await t.save();
+        } catch (e) {
+          logger.warn('Failed saving tontine lastReminderDate updates', e && e.message ? e.message : e);
+        }
+      }
+    }
+  } catch (e) {
+    logger.warn('sendTontineContributionReminders failed', e && e.message ? e.message : e);
+  }
+}
 
 // GET /api/ai/test - Minimal test to verify OpenAI connectivity (does not return the key)
 app.get('/api/ai/test', asyncHandler(async (req, res) => {
@@ -2476,6 +2617,14 @@ async function startServer() {
       if (NODE_ENV === 'production') {
         console.log(`📦 Serving static files from ${path.join(__dirname, 'public')}`);
       }
+      // Planified tontine reminders (server-side push). Runs periodically and is idempotent per day.
+      const minutes = Number(process.env.TONTINE_REMINDER_INTERVAL_MINUTES || 60);
+      const intervalMs = Math.max(5, minutes) * 60 * 1000; // minimum 5 minutes
+      setInterval(() => {
+        sendTontineContributionReminders().catch(err => {
+          logger.warn('Tontine reminder scheduler error', err && err.message ? err.message : err);
+        });
+      }, intervalMs);
     });
   } catch (error) {
     console.error('❌ Erreur au démarrage du serveur:', error);
