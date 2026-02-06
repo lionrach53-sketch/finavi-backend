@@ -11,6 +11,8 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const Joi = require('joi');
 const webpush = require('web-push');
+const PDFDocument = require('pdfkit');
+const ExcelJS = require('exceljs');
 const app = express();
 
 // Set NODE_ENV early - defaults to 'development' for fallback to MongoMemoryServer
@@ -525,15 +527,44 @@ async function calculateBudgetsAvailable(userId, currentDate, session = null) {
 
   // Compute total expenses for the month of currentDate (format YYYY-MM-DD)
   try {
-    const yearMonth = (currentDate || getTodayDate()).slice(0,7); // 'YYYY-MM'
+    const dateStr = currentDate || getTodayDate();
+    const yearMonth = dateStr.slice(0,7); // 'YYYY-MM'
+
+    // Compute positive carry-over from previous month: last Day.finalPocket of previous month
+    // This makes unspent "argent en poche" roll into the next month.
+    let carryOver = 0;
+    try {
+      const y = parseInt(dateStr.slice(0, 4), 10);
+      const m = parseInt(dateStr.slice(5, 7), 10);
+      if (!Number.isNaN(y) && !Number.isNaN(m)) {
+        let prevY = y;
+        let prevM = m - 1;
+        if (prevM === 0) {
+          prevM = 12;
+          prevY = y - 1;
+        }
+        const prevYearMonth = `${prevY}-${String(prevM).padStart(2, '0')}`;
+        const lastPrevDay = await Day.findOne({
+          userId,
+          date: { $regex: `^${prevYearMonth}` }
+        }).sort({ date: -1 });
+        if (lastPrevDay && lastPrevDay.finalPocket != null) {
+          carryOver = Math.max(0, Number(lastPrevDay.finalPocket || 0));
+        }
+      }
+    } catch (e) {
+      carryOver = 0;
+    }
+
     const txQuery = { userId, type: 'expense', date: { $regex: `^${yearMonth}` } };
     let txs;
     if (session) txs = await Transaction.find(txQuery).session(session);
     else txs = await Transaction.find(txQuery);
     const totalExpenses = txs.reduce((s, t) => s + Number(t.amount || 0), 0);
 
-    // Base salary to subtract from: prefer initialAmount, fallback to amount or currentAmount
-    const base = Number(primary.initialAmount || primary.amount || primary.currentAmount || 0);
+    // Base salary to subtract from: prefer initialAmount, fallback to amount or currentAmount,
+    // plus positive carry-over from previous month.
+    const base = Number(primary.initialAmount || primary.amount || primary.currentAmount || 0) + carryOver;
     const available = Math.max(0, Math.round((base - totalExpenses) * 100) / 100);
 
     // Reconcile stored primary.currentAmount with computed available when they differ.
@@ -649,6 +680,113 @@ function computeDynamicLimits(budgetsAvailable, currentDate) {
     dailyLimit,
     daysLeft,
     weeksLeft
+  };
+}
+
+// Build a monthly financial report (bilan) for a given user and month (YYYY-MM)
+async function buildMonthlyReport(userId, month) {
+  const monthStr = month || getTodayDate().slice(0, 7); // 'YYYY-MM'
+
+  const user = await User.findById(userId);
+  if (!user) throw new Error('Utilisateur non trouvé');
+
+  // Primary monthly budget (salary)
+  const primary = await Budget.findOne({ userId, frequency: 'monthly', isPrimary: true });
+
+  // Transactions of the month
+  const txQuery = { userId, date: { $regex: `^${monthStr}` } };
+  const txs = await Transaction.find(txQuery).sort({ date: 1, createdAt: 1 });
+
+  let totalIncome = 0;
+  let totalExpenses = 0;
+  const byBudget = new Map();
+
+  for (const t of txs) {
+    if (t.type === 'gain') totalIncome += Number(t.amount || 0);
+    if (t.type === 'expense') totalExpenses += Number(t.amount || 0);
+
+    const key = t.budgetId ? String(t.budgetId) : 'none';
+    if (!byBudget.has(key)) {
+      byBudget.set(key, { budgetId: key, totalIncome: 0, totalExpenses: 0, transactions: [] });
+    }
+    const agg = byBudget.get(key);
+    if (t.type === 'gain') agg.totalIncome += Number(t.amount || 0);
+    if (t.type === 'expense') agg.totalExpenses += Number(t.amount || 0);
+    agg.transactions.push({
+      date: t.date,
+      type: t.type,
+      amount: t.amount,
+      comment: t.comment || '',
+      budgetId: t.budgetId ? String(t.budgetId) : null
+    });
+  }
+
+  const net = totalIncome - totalExpenses;
+
+  // Daily history (Day collection) for the month
+  const days = await Day.find({
+    userId,
+    date: { $regex: `^${monthStr}` }
+  }).sort({ date: 1 });
+
+  const dailyHistory = days.map(d => ({
+    date: d.date,
+    initialPocket: d.initialPocket,
+    budgetsAvailable: d.budgetsAvailable,
+    gains: d.gains,
+    expenses: d.expenses,
+    finalPocket: d.finalPocket
+  }));
+
+  const startingBalance = dailyHistory.length ? dailyHistory[0].initialPocket : 0;
+  const endingBalance = dailyHistory.length ? dailyHistory[dailyHistory.length - 1].finalPocket : 0;
+
+  // Current remaining monthly budget (includes carry-over logic)
+  const anyDayInMonth = `${monthStr}-15`;
+  const monthlyAvailable = await calculateBudgetsAvailable(userId, anyDayInMonth);
+
+  // Attach human-readable budget info
+  const budgetIds = Array.from(byBudget.keys()).filter(k => k !== 'none');
+  const budgets = budgetIds.length ? await Budget.find({ _id: { $in: budgetIds } }) : [];
+  const budgetMap = new Map();
+  for (const b of budgets) budgetMap.set(String(b._id), b);
+
+  const breakdownByBudget = Array.from(byBudget.values()).map(entry => {
+    const b = entry.budgetId && entry.budgetId !== 'none' ? budgetMap.get(entry.budgetId) : null;
+    return {
+      budgetId: entry.budgetId === 'none' ? null : entry.budgetId,
+      budgetName: b ? b.name : 'Sans budget',
+      frequency: b ? b.frequency : null,
+      totalIncome: entry.totalIncome,
+      totalExpenses: entry.totalExpenses
+    };
+  });
+
+  return {
+    user: {
+      id: user._id.toString(),
+      name: user.name,
+      email: user.email
+    },
+    month: monthStr,
+    salaryBase: primary ? Number(primary.initialAmount || primary.amount || primary.currentAmount || 0) : 0,
+    totals: {
+      totalIncome,
+      totalExpenses,
+      net,
+      startingBalance,
+      endingBalance,
+      monthlyAvailable
+    },
+    breakdownByBudget,
+    dailyHistory,
+    transactions: txs.map(t => ({
+      date: t.date,
+      type: t.type,
+      amount: t.amount,
+      comment: t.comment || '',
+      budgetId: t.budgetId ? String(t.budgetId) : null
+    }))
   };
 }
 
@@ -1417,6 +1555,97 @@ app.get('/api/dashboard/:userId', asyncHandler(async (req, res) => {
     objectives: objectivesFormatted,
     aiAdvice
   });
+}));
+
+// GET /api/reports/monthly/:userId - Rapport mensuel (JSON, PDF ou Excel)
+// Query params:
+//   month=YYYY-MM (optionnel, défaut: mois courant)
+//   format=json|pdf|excel (optionnel, défaut: json)
+app.get('/api/reports/monthly/:userId', asyncHandler(async (req, res) => {
+  let { userId } = req.params;
+  userId = await resolveUserId(userId);
+
+  const { month, format } = req.query;
+  const monthStr = typeof month === 'string' && month.match(/^\d{4}-\d{2}$/) ? month : getTodayDate().slice(0, 7);
+  const fmt = (format || 'json').toString().toLowerCase();
+
+  const report = await buildMonthlyReport(userId, monthStr);
+
+  if (fmt === 'pdf') {
+    const doc = new PDFDocument({ margin: 40 });
+    const filename = `finavi-rapport-${monthStr}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    doc.fontSize(18).text('Bilan Financier Personnel', { align: 'center' });
+    doc.moveDown();
+    doc.fontSize(12).text(`Utilisateur : ${report.user.name} (${report.user.email})`);
+    doc.text(`Mois : ${report.month}`);
+    doc.moveDown();
+
+    doc.fontSize(14).text('Résumé global');
+    doc.fontSize(12).text(`Revenus totaux : ${report.totals.totalIncome} XOF`);
+    doc.text(`Dépenses totales : ${report.totals.totalExpenses} XOF`);
+    doc.text(`Solde net : ${report.totals.net} XOF`);
+    doc.text(`Solde début de mois : ${report.totals.startingBalance} XOF`);
+    doc.text(`Solde fin de mois : ${report.totals.endingBalance} XOF`);
+    doc.text(`Budget mensuel restant (fin de mois) : ${report.totals.monthlyAvailable} XOF`);
+    doc.moveDown();
+
+    doc.fontSize(14).text('Par budget');
+    report.breakdownByBudget.forEach(b => {
+      doc.fontSize(12).text(`- ${b.budgetName} [${b.frequency || 'n/a'}] : +${b.totalIncome} / -${b.totalExpenses} XOF`);
+    });
+    doc.moveDown();
+
+    doc.fontSize(14).text('Historique journalier');
+    report.dailyHistory.forEach(d => {
+      doc.fontSize(10).text(`${d.date} | gains: ${d.gains} XOF, dépenses: ${d.expenses} XOF, fin de journée: ${d.finalPocket} XOF`);
+    });
+
+    doc.end();
+    doc.pipe(res);
+    return;
+  }
+
+  if (fmt === 'excel' || fmt === 'xlsx') {
+    const workbook = new ExcelJS.Workbook();
+    const sheetSummary = workbook.addWorksheet('Résumé');
+    const sheetBudgets = workbook.addWorksheet('Par budget');
+    const sheetDays = workbook.addWorksheet('Jours');
+
+    sheetSummary.addRow(['Bilan Financier Personnel']);
+    sheetSummary.addRow([`Utilisateur : ${report.user.name} (${report.user.email})`]);
+    sheetSummary.addRow([`Mois : ${report.month}`]);
+    sheetSummary.addRow([]);
+    sheetSummary.addRow(['Revenus totaux', report.totals.totalIncome]);
+    sheetSummary.addRow(['Dépenses totales', report.totals.totalExpenses]);
+    sheetSummary.addRow(['Solde net', report.totals.net]);
+    sheetSummary.addRow(['Solde début de mois', report.totals.startingBalance]);
+    sheetSummary.addRow(['Solde fin de mois', report.totals.endingBalance]);
+    sheetSummary.addRow(['Budget mensuel restant', report.totals.monthlyAvailable]);
+
+    sheetBudgets.addRow(['Budget', 'Fréquence', 'Revenus', 'Dépenses']);
+    report.breakdownByBudget.forEach(b => {
+      sheetBudgets.addRow([b.budgetName, b.frequency || '', b.totalIncome, b.totalExpenses]);
+    });
+
+    sheetDays.addRow(['Date', 'Gains', 'Dépenses', 'Fin de journée']);
+    report.dailyHistory.forEach(d => {
+      sheetDays.addRow([d.date, d.gains, d.expenses, d.finalPocket]);
+    });
+
+    const filename = `finavi-rapport-${monthStr}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    await workbook.xlsx.write(res);
+    res.end();
+    return;
+  }
+
+  // Default: JSON
+  res.json({ success: true, report });
 }));
 
 // POST /api/register - Enregistrer un nouvel utilisateur
